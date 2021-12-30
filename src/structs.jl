@@ -68,6 +68,7 @@ end
 struct TabuSearchOptimizer
     maxiter::Int
     tabulength::Int
+    infeaslength::Int
     rr2::RR2
     constraints::Vector{Constraint}
     conentries::BitArray{3}
@@ -77,18 +78,17 @@ const Move = Tuple{Symbol, Int64, Int64, Vararg{Int64, N} where N}
 
 mutable struct SearchState
     it::Int # iteration count
-    val::Float64 # current value
+    hpen::Int
+    spen::Int # current value
     sched::Matrix{Int}
-    optval::Float64 # best known value
-    optsched::Matrix{Int} # best known feasible schedule
+    optval::Int # best known value
+    optsched::Matrix{Int} # best known solution
     lastimprov::Int # last iteration in which global improvement of obj function was fou
     offset::Vector{Int}
     moves::Vector{Move}
     tabu::Dict{Move,Int}
     blocked::Dict{Move,Int}
     pen::Vector{Float64} # penalty for each constraint
-    fr::Matrix{Int}
-    diversify::Bool
 end
 
 function IdxSet(A::Vector{T}) where {T<:Integer}

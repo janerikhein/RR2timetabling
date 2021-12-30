@@ -1,8 +1,8 @@
 """
     heur_solution(inst::Instance)
 
-Computes a heuristic start solution schedule, satisfying all hard constraints
-of `inst`.
+Computes a heuristic solution schedule, satisfying all hard constraints
+minimizing the panalties
 
 # Arguments
 -`inst::Instance` - the problem instance
@@ -12,62 +12,115 @@ The heuristic first generates a start solution, satisfying all base constraints.
 Then a Tabu Search algorithm is used to minimize the penalty induced by the hard
 constraints of `inst`.
 """
-function heur_solution(inst::Instance; maxbreaks = 3, maxiter = 200, maxdiviter = 15, tabulength = 20, gamtimelimit = 60.0, maxphases=10, start=nothing)
+function heur_solution(
+    inst::Instance;
+    maxbreaks = 3,
+    maxiter = 1000,
+    infeaslength = 5,
+    tabulength = 20,
+    lastfeaslength = 50,
+    gamtimelimit = 1200.0,
+    maxphases = 20,
+    inithardpen = 100,
+    relaxphased = true,
+    start = nothing,
+)
     # compute initial solution satisfyng all pattern & patternset constraints
-    if start===nothing
+    if start === nothing
         schedbuf = Matrix{Int}(undef, inst.rr2.nteams, inst.rr2.nslots)
-        start = pgba_heuristic(inst, maxbreaks, schedbuf; gamtimelimit = gamtimelimit)
+        start = pgba_heuristic(
+            inst,
+            maxbreaks,
+            schedbuf;
+            gamtimelimit = gamtimelimit,
+        )
     end
     start::Matrix{Int}
-    patcons, patsetcons, gencons = group_constraints(inst; f = ishard)
 
-    # adding phased constraints as game constraints
-    if inst.rr2.isphased
-        slots = IdxSet(2^(inst.rr2.nslots÷2)-1)
+    if inst.rr2.isphased && relaxphased
+        phasedcons = Vector{Constraint}()
+        slots = IdxSet(2^(inst.rr2.nslots ÷ 2) - 1)
         for i = 1:inst.rr2.nteams
             for j = i+1:inst.rr2.nteams
-                push!(gencons, GAcon(slots, 1, 1, [(i,j), (j,i)], 0))
+                push!(phasedcons, GAcon(slots, 1, 1, [(i, j), (j, i)], 0))
             end
         end
         rr2 = RR2(inst.rr2.nteams, inst.rr2.nslots, false)
-    else
-        rr2 = inst.rr2
+        inst = Instance(rr2, vcat(constraints(inst), phasedcons))
     end
 
-    relinst = relaxed(Instance(rr2, vcat(vcat(patcons...), patsetcons, gencons)))
-    tso, state = initialize_search(relinst, start, maxiter, tabulength)
+    cons = constraints(inst)
+    hardCons = ishard.(cons)
+    #lastfeas = [trues(lastfeaslength) for c = 1:length(cons)]
+    pen = Int.([ishard(c) ? inithardpen : c.pen for c in cons])
 
-    patconidx = filter(
-        i -> is_pattern_constraint(inst.rr2, tso.constraints[i]),
-        1:length(tso.constraints),
-    )
-    patsetconidx = filter(
-        i -> is_pattern_set_constraint(inst.rr2, tso.constraints[i]),
-        1:length(tso.constraints),
-    )
+    tso, state =
+        initialize_search(inst.rr2, cons, pen, start, maxiter, tabulength, infeaslength)
     offsetbuf, schedbuf, difbuf = init_buffers(tso, state)
-    is_feas = trues(inst.rr2.nteams)
-    lastfeas = [trues(tabulength) for i in 1:inst.rr2.nteams]
+    starttime = time()
+
+    tabu = deepcopy(state.tabu)
+    add_tabu = Vector{Move}()
+    #allow_infeas = false
     for phc = 1:maxphases
+#        allow_infeas = !allow_infeas
+        state.lastimprov = state.it
+        @show state.lastimprov, maxiter, state.it
+#        @show allow_infeas
         while state.lastimprov + maxiter >= state.it
-            @show state.it, state.val
-            search_step!(tso, state, offsetbuf, schedbuf, difbuf)
-            if state.optval == 0
-                return state.optsched
+            search_step!(
+                tso,
+                state,
+                offsetbuf,
+                schedbuf,
+                difbuf,
+                accept_infeas = false,
+            )
+            # logging
+            print("it ", state.it)
+            print(" hpen ", state.hpen, " spen ", state.spen)
+            print(" optval ", state.optval, " lastimprov ", state.lastimprov)
+            print(" time ", round(time() - starttime, digits = 3), "\n")
+            if state.hpen == 0 && state.spen == state.optval
+                println(
+                    "new best feasible solution found with value ",
+                    state.optval,
+                )
+                println(state.optsched)
+                if state.spen == 0
+                    return state.optsched, state.optval
+                end
+                tabu = deepcopy(state.tabu)
+                add_tabu = Vector{Move}()
             end
         end
-        println("diversifying")
-        state.diversify = true
-        state.sched .= state.optsched
-        state.val = 0
-        state.lastimprov = state.it
-        for it = 1:maxdiviter
-            search_step!(tso, state, offsetbuf, schedbuf, difbuf)
+        if state.optval == typemax(Int) # no feasible solution found
+            return state.optsched, typemax(Int)
         end
-        state.val = sum(state.offset[i]*state.pen[i] for i in 1:length(state.offset))
-        @show state.val, state.it, state.lastimprov, maxiter
-        state.diversify = false
+        map!(i -> i + state.it - state.lastimprov, values(tabu))
+        state.tabu = deepcopy(tabu)
+        state.sched .= state.optsched
+        state.hpen, state.spen = 0, state.optval
+        for mv in add_tabu
+            state.tabu[mv] = state.it + tabulength
+        end
+        println("accepting infeasible solutions...")
+        for k = 1:infeaslength
+            println("spen, hpen =", state.spen, " ", state.hpen)
+            push!(
+                add_tabu,
+                search_step!(
+                    tso,
+                    state,
+                    offsetbuf,
+                    schedbuf,
+                    difbuf,
+                    accept_infeas = true,
+                ),
+            )
+        end
     end
+    return state.optsched, state.optval
 end
 
 """
@@ -110,7 +163,6 @@ function assign_games!(
     timelimit = GRB_INFINITY,
     usestart = true,
 )
-    @show timelimit
     gam = game_alloc_model(rr2, patternset, gencons; feas_relax = true)
     x = gam[:x]
     if usestart

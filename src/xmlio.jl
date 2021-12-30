@@ -233,5 +233,13 @@ function toxml(sched::Matrix{Int}, filename::String)
         end
         write(io, "</Games>\n</Solution>")
     end
+end
 
+function tofile(sched::Matrix{Int}, filename::String)
+    open(filename, "w") do io
+        for i = 1:size(sched, 1)
+            write(io, join(sched[i,:], " "))
+            write(io, "\n")
+        end
+    end
 end

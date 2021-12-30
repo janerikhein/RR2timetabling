@@ -2,39 +2,50 @@
 Initializes the `TabuSearchOptimizer` and the `SearchState`.
 """
 function initialize_search(
-    inst::Instance,
+    rr2::RR2,
+    cons::Vector{Constraint},
+    pen::Vector{Int},
     start::Matrix{Int},
     maxiter::Int,
     tabulength::Int,
+    infeaslength::Int,
 )
-    cons = sort!(constraints(inst), by = !ishard)
-    pen = [c.pen for c in cons]
-    entries = conentries(inst.rr2, cons)
-    tso = TabuSearchOptimizer(maxiter, tabulength, inst.rr2, cons, entries)
-    val = 0
+    entries = conentries(rr2, cons)
+    tso = TabuSearchOptimizer(
+        maxiter,
+        tabulength,
+        infeaslength,
+        rr2,
+        cons,
+        entries,
+    )
+    hpen, spen = 0, 0
     offset = [eval_constraint(start, c) for c in cons]
     for (i, c) in enumerate(cons)
-        @assert c.pen != 0 || offset[i] == 0
-        val += offset[i] * c.pen
+        if c.pen == 0
+            hpen += offset[i] * pen[i]
+        else
+            spen += offset[i] * pen[i]
+        end
     end
-    moves = getmoves(inst.rr2)
-    tabu = Dict((m, 0) for m in moves)
-    blocked = Dict((m, 0) for m in getmoves(inst.rr2))
+    moves = getmoves(rr2)
 
+    tabu = Dict((m, 0) for m in moves)
+    blocked = Dict((m, 0) for m in getmoves(rr2))
+    optval = hpen == 0 ? spen : typemax(Int)
     state = SearchState(
-        0,
-        val,
-        copy(start),
-        val,
-        copy(start),
-        0,
+        0, #it
+        hpen,
+        spen,
+        copy(start), #sched
+        optval,
+        copy(start), #optsched
+        0, #lastimprov
         offset,
         moves,
         tabu,
         blocked,
         pen,
-        zeros(Int, size(start)),
-        false
     )
     return tso, state
 end
@@ -67,37 +78,42 @@ function search_step!(
     state::SearchState,
     offsetbuf::Vector{Int},
     schedbuf::Matrix{Int},
-    difbuf::BitMatrix,
+    difbuf::BitMatrix;
+    accept_infeas = false,
 )
     state.it += 1
-    bestmv = nothing
-    bestval = typemax(Int)
+    opt_feas_mv, opt_infeas_mv = nothing, nothing
+    opt_infeas_hpen, opt_infeas_spen = typemax(Int), typemax(Int)
+    opt_feas_spen = typemax(Int)
 
+    # compute constrained entries of violated constraints
     infeas = falses(size(schedbuf))
     for idx in 1:length(tso.constraints)
         if state.offset[idx] > 0
             infeas = infeas .| @view tso.conentries[:,:,idx]
         end
     end
+    if !any(infeas)
+        infeas .= true
+    end
 
+    # randomize move order
     shuffle!(state.moves)
 
     for mv in state.moves
         # identical move already evaluated this iteration
         state.blocked[mv] == state.it && continue
-
         # reset buffers
         offsetbuf .= state.offset
         schedbuf .= state.sched
 
         move!(schedbuf, mv)
+        # check if move changes constrained entry
         difbuf .= (schedbuf .!= state.sched)
-        if !state.diversify && !any(difbuf .& infeas)
-            continue
-        end
+        !any(difbuf .& infeas) && continue
 
         # evaluate move and block equivalent moves
-        isfeas = eval_move!(
+        eval_move!(
             offsetbuf,
             schedbuf,
             difbuf,
@@ -106,36 +122,66 @@ function search_step!(
             tso.conentries,
         )
         block_equiv!(state.blocked, mv, difbuf, state.it)
-        !isfeas && continue
-        ncons = length(tso.constraints)
-        mvval = sum(state.pen[i] * offsetbuf[i] for i = 1:ncons)
-        if state.diversify
-            mvval += sum(state.fr[c] for c in findall(difbuf))
+
+        hpen, spen = 0, 0
+        hpenold, spenold = 0, 0
+        for i in 1:length(tso.constraints)
+            if tso.constraints[i].pen == 0
+                hpen += state.pen[i] * offsetbuf[i]
+                hpenold += state.pen[i] * state.offset[i]
+            else
+                spen += state.pen[i] * offsetbuf[i]
+                spenold += state.pen[i] * state.offset[i]
+            end
         end
 
         if state.tabu[mv] >= state.it # move is marked tabu
-            if !state.diversify && mvval < state.optval # global improvement (aspiration)
-                bestmv, bestval = mv, mvval
+            # aspiration
+            if hpen == 0 && spen < state.optval
+                opt_feas_mv, opt_feas_spen = mv, spen
                 break
             end
         else
-            if mvval < state.val
-                bestmv, bestval = mv, mvval # local improvement
-                break
-            elseif mvval < bestval
-                bestmv, bestval = mv, mvval
+            if hpen == 0
+                if spen < spenold
+                    opt_feas_mv, opt_feas_spen = mv, spen
+                    break
+                elseif spen < opt_feas_spen
+                    opt_feas_mv, opt_feas_spen = mv, spen
+                end
+            else
+                if (spen < spenold && hpen <= hpenold) || (spen <= spenold && hpen < hpenold)
+                    opt_infeas_mv = mv
+                    opt_infeas_hpen, opt_infeas_spen = hpen, spen
+                    break
+                elseif hpenold == 0 && (spen, hpen) < (opt_infeas_spen, opt_infeas_hpen)
+                    opt_infeas_mv = mv
+                    opt_infeas_hpen, opt_infeas_spen = hpen, spen
+                elseif hpenold > 0 && (hpen, spen) < (opt_infeas_hpen, opt_infeas_spen)
+                    opt_infeas_mv = mv
+                    opt_infeas_hpen, opt_infeas_spen = hpen, spen
+                end
             end
         end
     end
 
-    if bestmv === nothing # no feasible neighbor solution found
-        return false
+    if opt_feas_mv === nothing # no feasible neighbor solution found
+        @assert opt_infeas_mv !== nothing
+        bestmv = opt_infeas_mv
+        state.hpen, state.spen = opt_infeas_hpen, opt_infeas_spen
+    else
+        if accept_infeas && opt_infeas_spen < opt_feas_spen
+            @assert opt_infeas_mv !== nothing
+            bestmv = opt_infeas_mv
+            state.hpen, state.spen = opt_infeas_hpen, opt_infeas_spen
+        else
+            bestmv = opt_feas_mv
+            state.hpen, state.spen = 0, opt_feas_spen
+        end
     end
-    @show bestmv
     schedbuf .= state.sched
     move!(schedbuf, bestmv)
     difbuf .= (schedbuf .!= state.sched)
-    state.fr .+= difbuf
     eval_move!(
         state.offset,
         schedbuf,
@@ -145,19 +191,16 @@ function search_step!(
         tso.conentries,
     )
     move!(state.sched, bestmv)
-    state.val = bestval
-    if !state.diversify && state.val < state.optval
+
+    if state.hpen == 0 && state.spen < state.optval
         state.optsched .= state.sched
-        state.optval = state.val
+        state.optval = state.spen
         state.lastimprov = state.it
     end
 
-    if state.val == state.optval
-        state.optsched .= state.sched
-    end
     # mark bestmv and equivalent moves as tabu
     block_equiv!(state.tabu, bestmv, difbuf, state.it + tso.tabulength)
-    return true
+    return bestmv
 end
 
 """
@@ -192,12 +235,8 @@ function eval_move!(
     for (i, c) in enumerate(constraints)
         if any(difbuf .& entries[:, :, i])
             offsetbuf[i] = eval_constraint(schedbuf, c)
-            if c.pen == 0 && offsetbuf[i] > 0
-                return false
-            end
         end
     end
-    return true
 end
 
 """
